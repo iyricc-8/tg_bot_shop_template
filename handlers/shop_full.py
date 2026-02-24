@@ -449,9 +449,149 @@ async def confirm_order(callback: CallbackQuery, state: FSMContext):
     text += f"Jami summa: <b>{total_price:,.0f} so'm</b>\n\n"
     text += "💳 To'lov usulini tanlang:"
     
+    await state.update_data(order_id=data['order_id'], total_price=total_price)
+    
     await callback.message.edit_text(
         text,
         reply_markup=get_payment_method_kb(),
+        parse_mode="HTML"
+    )
+    
+    await callback.answer()
+
+
+# ========================
+# PAYMENT HANDLERS
+# ========================
+
+async def process_payment(callback: CallbackQuery, state: FSMContext, payment_method: str):
+    """Общий обработчик платежей"""
+    from services.invoice_generator import generate_invoice
+    
+    data = await state.get_data()
+    order_id = data.get('order_id')
+    
+    if not order_id:
+        await callback.answer("Xato: Buyurtma topilmadi!", show_alert=True)
+        return
+    
+    async with AsyncSessionLocal() as session:
+        # Получаем информацию о заказе
+        order = await OrderService.get_order_by_id(session, order_id)
+        user = await UserService.get_user_by_telegram_id(session, callback.from_user.id)
+        payment = await PaymentService.get_payment_by_order_id(session, order_id)
+        
+        # Обновляем статус платежа
+        if payment:
+            await PaymentService.update_payment_status(
+                session, payment.id, "tasdiqlandi", payment_method
+            )
+        
+        # Обновляем статус заказа
+        await OrderService.update_order_status(session, order_id, "tasdiqlandi")
+        
+        # Подготавливаем данные для чека
+        await session.refresh(order, ["items", "user"])
+        
+        items_for_invoice = []
+        for item in order.items:
+            await session.refresh(item, ["product"])
+            items_for_invoice.append((
+                item.product.name_uz,
+                item.quantity,
+                item.price_at_purchase
+            ))
+    
+    # Генерируем чек
+    payment_methods = {
+        "payment_click": "💳 Click",
+        "payment_payme": "📱 Payme",
+        "payment_card": "🏧 Karta",
+        "payment_cash": "🏪 Naqd To'lov",
+        "payment_transfer": "🔄 Ko'chirish"
+    }
+    
+    method_name = payment_methods.get(callback.data, "Noma'lum")
+    
+    invoice_text = generate_invoice(
+        order_id=order_id,
+        first_name=user.first_name or "",
+        last_name=user.last_name or "",
+        phone=user.phone_number or "---",
+        address=user.address or "---",
+        total=order.total_price,
+        items=items_for_invoice
+    )
+    
+    # Добавляем информацию о способе платежа
+    invoice_text += f"\n💳 <b>TO'LOV USULI:</b> {method_name}\n"
+    invoice_text += "✅ <b>TO'LOV QABUL QILINDI!</b>\n\n"
+    invoice_text += "Sizga tez orada xabar yuboriladi. Raxmat! 🙏"
+    
+    # Отправляем чек
+    await callback.message.edit_text(
+        invoice_text,
+        reply_markup=None,
+        parse_mode="HTML"
+    )
+    
+    # Отправляем подтверждение на главное меню
+    await callback.message.answer(
+        "🏠 Asosiy menyu",
+        reply_markup=get_main_menu_kb()
+    )
+    
+    await state.clear()
+    await callback.answer(f"✅ {method_name} orqali to'lov qabul qilindi!", show_alert=False)
+
+
+@router.callback_query(F.data == "payment_click")
+async def payment_click(callback: CallbackQuery, state: FSMContext):
+    """Click orqali to'lov"""
+    await process_payment(callback, state, "Click")
+
+
+@router.callback_query(F.data == "payment_payme")
+async def payment_payme(callback: CallbackQuery, state: FSMContext):
+    """Payme orqali to'lov"""
+    await process_payment(callback, state, "Payme")
+
+
+@router.callback_query(F.data == "payment_card")
+async def payment_card(callback: CallbackQuery, state: FSMContext):
+    """Karta orqali to'lov"""
+    await process_payment(callback, state, "Karta")
+
+
+@router.callback_query(F.data == "payment_cash")
+async def payment_cash(callback: CallbackQuery, state: FSMContext):
+    """Naqd to'lov"""
+    await process_payment(callback, state, "Naqd To'lov")
+
+
+@router.callback_query(F.data == "payment_transfer")
+async def payment_transfer(callback: CallbackQuery, state: FSMContext):
+    """Ko'chirish orqali to'lov"""
+    await process_payment(callback, state, "Ko'chirish")
+
+
+@router.callback_query(F.data == "cancel_payment")
+async def cancel_payment(callback: CallbackQuery, state: FSMContext):
+    """Bekor qilish"""
+    data = await state.get_data()
+    order_id = data.get('order_id')
+    
+    if order_id:
+        async with AsyncSessionLocal() as session:
+            # Bekor qilish
+            await OrderService.update_order_status(session, order_id, "bekor_qilingan")
+    
+    text = "❌ <b>Buyurtma bekor qilindi!</b>\n\n"
+    text += "Yangi buyurtma qilish uchun /shop buyruq yuboring."
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_main_menu_kb(),
         parse_mode="HTML"
     )
     
